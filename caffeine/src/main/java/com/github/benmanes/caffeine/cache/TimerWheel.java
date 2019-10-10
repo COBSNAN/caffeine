@@ -168,6 +168,7 @@ final class TimerWheel<K, V> {
    * @param node the entry in the cache
    */
   public void schedule(@NonNull Node<K, V> node) {
+    //找到插入时间轮的位置
     Node<K, V> sentinel = findBucket(node.getVariableTime());
     link(sentinel, node);
   }

@@ -77,6 +77,25 @@ import com.github.benmanes.caffeine.cache.LinkedDeque.PeekingIterator;
 import com.github.benmanes.caffeine.cache.References.InternalReference;
 import com.github.benmanes.caffeine.cache.stats.StatsCounter;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
+/**
+ * TODO IMPORTANT
+ * 4个关于get put 的队列，用于读写过期操作，而读3个队列在区分热门数据分区
+ * - accessOrderWindowDeque
+ * - accessOrderProbationDeque
+ * - accessOrderProtectedDeque
+ * - writeOrderDeque
+ *
+ *2个buffer 主要是用来异步执行一些数据
+ *readbuffer 用来记录读取记录，线程异步给相关key计数，重排等操作  BoundedBuffer
+ *writebuffer value Future  获取值 由各生产类定义
+ *
+ * FrequencySketch 读取记录操作统计 一个long类型 64位，每4位做一个记录，分成了16个记录段
+ *
+ * TimerWheel 按顺序过期时间插入，作用于存取类型自己的过期时间，可以合refresh联合使用
+ *
+ *BoundedLocalCache 继承了DrainStatusRef ，使drainStatus 可以在一个缓冲行，减少其他类型的修改对drainStatus的信息，因为程序中存在大量的读取这个值
+ * BoundedBuffer于上一致
+ */
 
 /**
  * An in-memory cache implementation that supports full concurrency of retrievals, a high expected
@@ -583,8 +602,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     if (maximum == maximum()) {
       return;
     }
-
     long max = Math.min(maximum, MAXIMUM_CAPACITY);
+    //进行区分window 新添加缓存
     long window = max - (long) (PERCENT_MAIN * max);
     long mainProtected = (long) (PERCENT_MAIN_PROTECTED * (max - window));
 
@@ -630,6 +649,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
 
       Node<K, V> next = node.getNextInAccessOrder();
       if (node.getWeight() != 0) {
+        //移动window 队列，新添加的数据到main区的probation队列中
         node.makeMainProbation();
         accessOrderWindowDeque().remove(node);
         accessOrderProbationDeque().add(node);
@@ -661,6 +681,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     int victimQueue = PROBATION;
     Node<K, V> victim = accessOrderProbationDeque().peekFirst();
     Node<K, V> candidate = accessOrderProbationDeque().peekLast();
+    //如果大小大于最大大小，这根据 probation protected window 的顺序，找到第一个可以处理的node节点
     while (weightedSize() > maximum()) {
       // Stop trying to evict candidates and always prefer the victim
       if (candidates == 0) {
@@ -736,6 +757,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
 
       // Evict the entry with the lowest frequency
       candidates--;
+      //判断2个key的请求情况，选取访问率低下的进行删除
       if (admit(candidateKey, victimKey)) {
         Node<K, V> evict = victim;
         victim = victim.getNextInAccessOrder();
@@ -778,6 +800,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
   /** Expires entries that have expired by access, write, or variable. */
   @GuardedBy("evictionLock")
   void expireEntries() {
+    //清理过期数据，所有队列都已经排好对应过期顺序，所以从第一个处理即可，排序规则再那暂时目前不太清除 TODO
     long now = expirationTicker().read();
     expireAfterAccessEntries(now);
     expireAfterWriteEntries(now);
@@ -786,6 +809,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     if (pacer() != null) {
       long delay = getExpirationDelay(now);
       if (delay != Long.MAX_VALUE) {
+        //有设置定期清理任务
         pacer().schedule(executor, drainBuffersTask, now, delay);
       }
     }
@@ -814,6 +838,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       if ((node == null) || ((now - node.getAccessTime()) < duration)) {
         return;
       }
+      //处理数据
       evictEntry(node, RemovalCause.EXPIRED, now);
     }
   }
@@ -838,6 +863,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
   @GuardedBy("evictionLock")
   void expireVariableEntries(long now) {
     if (expiresVariable()) {
+      //TimerWheel 类
       timerWheel().advance(now);
     }
   }
@@ -891,6 +917,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    * @param now the current time, used only if expiring
    * @return if the entry was evicted
    */
+  //删除节点信息
   @GuardedBy("evictionLock")
   @SuppressWarnings({"PMD.CollapsibleIfStatements", "GuardedByChecker"})
   boolean evictEntry(Node<K, V> node, RemovalCause cause, long now) {
@@ -988,6 +1015,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     }
 
     determineAdjustment();
+    //调整 main 区 protected 和 Probation
     demoteFromMainProtected();
     long amount = adjustment();
     if (amount == 0) {
@@ -1170,6 +1198,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    */
   @SuppressWarnings("FutureReturnValueIgnored")
   void refreshIfNeeded(Node<K, V> node, long now) {
+    //查询 更新值，这满足我们这样需求，以前老数据可以满足用户查看，但到某一时间，需要更新数据
     if (!refreshAfterWrite()) {
       return;
     }
@@ -1406,6 +1435,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    * replacement policy. If the executor rejects the task then it is run directly.
    */
   void scheduleDrainBuffers() {
+    //如果大于等于2 说明有程序在运行，不必再运行了
     if (drainStatus() >= PROCESSING_TO_IDLE) {
       return;
     }
@@ -1460,27 +1490,31 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    *
    * @param task an additional pending task to run, or {@code null} if not present
    */
+  //过期设置,最后都调用这个方法
   @GuardedBy("evictionLock")
   void maintenance(@Nullable Runnable task) {
     lazySetDrainStatus(PROCESSING_TO_IDLE);
 
     try {
+      //在get读取的时候 添加到buffer，然后异步统计key读取数据和队列排序
       drainReadBuffer();
-
+      //在value是future写入的时候，会用到这个writeBuffer,异步生产key
       drainWriteBuffer();
       if (task != null) {
         task.run();
       }
-
+      //软，弱引用类型清除
       drainKeyReferences();
       drainValueReferences();
 
       expireEntries();
+      //超出内容限制
       evictEntries();
 
       climb();
     } finally {
       if ((drainStatus() != PROCESSING_TO_IDLE) || !casDrainStatus(PROCESSING_TO_IDLE, IDLE)) {
+        //
         lazySetDrainStatus(REQUIRED);
       }
     }
@@ -1522,6 +1556,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
   @GuardedBy("evictionLock")
   void drainReadBuffer() {
     if (!skipReadBuffer()) {
+      //一般在BoundedBuffer 中
       readBuffer.drainTo(accessPolicy);
     }
   }
@@ -1587,6 +1622,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     }
 
     for (int i = 0; i < WRITE_BUFFER_MAX; i++) {
+      //writeBuffer 在生成的实例中实例化
       Runnable task = writeBuffer().poll();
       if (task == null) {
         return;
@@ -1647,6 +1683,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         if (weightedSize >= (maximum >>> 1)) {
           // Lazily initialize when close to the maximum
           long capacity = isWeighted() ? data.mappingCount() : maximum;
+          //初始化统计读取个数 table信息，由下面的increment 添加计数
           frequencySketch().ensureCapacity(capacity);
         }
 
@@ -1742,6 +1779,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         node.setPolicyWeight(node.getPolicyWeight() + weightDifference);
       }
       if (evicts() || expiresAfterAccess()) {
+        //更新node访问次数等
         onAccess(node);
       }
       if (expiresAfterWrite()) {
@@ -1875,6 +1913,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     Node<K, V> node = data.get(nodeFactory.newLookupKey(key));
     if (node == null) {
       if (recordStats) {
+        //统计未被hit记录
         statsCounter().recordMisses(1);
       }
       return null;
@@ -1886,6 +1925,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       if (recordStats) {
         statsCounter().recordMisses(1);
       }
+      //异步轮训 处理buffer 读写buffer ，过期，超大小内存清理，区域平衡
       scheduleDrainBuffers();
       return null;
     }
@@ -1894,6 +1934,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       @SuppressWarnings("unchecked")
       K castedKey = (K) key;
       setAccessTime(node, now);
+      //更新读取时间
       tryExpireAfterRead(node, castedKey, value, expiry(), now);
     }
     afterRead(node, now, recordStats);

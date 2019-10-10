@@ -136,6 +136,7 @@ final class FrequencySketch<E> {
     }
 
     int hash = spread(e.hashCode());
+    //long型 开始位置，以4位 保存一个记录 0 4 8 12
     int start = (hash & 3) << 2;
 
     // Loop unrolling improves throughput by 5m ops/s
@@ -191,6 +192,7 @@ final class FrequencySketch<E> {
   int indexOf(int item, int i) {
     long hash = SEED[i] * item;
     hash += hash >>> 32;
+    //上面是打乱了hash，减少冲突
     return ((int) hash) & tableMask;
   }
 
